@@ -1,3 +1,4 @@
+# ds34vita has the DualSense support. This is only made for people who don't want all three controller support.
 # ds5vita
 **Warning:**
 I have no Idea if this works. Please let me know. And use it at your OWN RISK!
