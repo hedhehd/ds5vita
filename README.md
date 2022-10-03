@@ -1,6 +1,6 @@
 # ds5vita
 **Warning**
-I have no Idea if this works. Please let me know.
+I have no Idea if this works. Please let me know. And use it at your OWN RISK!
 
 **Download**: https://github.com/hedhehd/ds5vita/releases
 
