@@ -7,66 +7,27 @@
 #include <psp2/touch.h>
 #include <psp2/motion.h>
 #include <taihen.h>
-#include <math.h>
 #include "log.h"
 
-/*
- * Needed by newlib's libm.
- */
-int __errno;
-
-#define DS5_VID 0x054C
-#define DS5_PID 0x0CE6
-#define DS5_NEW_PID 0x09CC
+#define DS5_VID   0x054C
+#define DS5_PID   0x05C4
+#define DS5_2_PID 0x09CC
 
 #define DS5_TOUCHPAD_W 1920
-#define DS5_TOUCHPAD_H 1070
-#define DS5_TOUCHPAD_W_DEAD 60
-#define DS5_TOUCHPAD_H_DEAD 60
-#define DS5_JOYSTICK_THRESHOLD 50
-#define DS5_TRIGGER_THRESHOLD 0
+#define DS5_TOUCHPAD_H 940
+#define DS5_ANALOG_THRESHOLD 3
 
 #define VITA_FRONT_TOUCHSCREEN_W 1920
 #define VITA_FRONT_TOUCHSCREEN_H 1080
 
-#define VITA_BACK_TOUCHSCREEN_W 1920
-#define VITA_BACK_TOUCHSCREEN_H 890
-
-#define EVF_EXIT	(1 << 0)
-
 #define abs(x) (((x) < 0) ? -(x) : (x))
-
-#define DECL_FUNC_HOOK(name, ...) \
-	static tai_hook_ref_t name##_ref; \
-	static SceUID name##_hook_uid = -1; \
-	static int name##_hook_func(__VA_ARGS__)
-
-#define BIND_FUNC_OFFSET_HOOK(name, pid, modid, segidx, offset, thumb) \
-	name##_hook_uid = taiHookFunctionOffsetForKernel((pid), \
-		&name##_ref, (modid), (segidx), (offset), thumb, name##_hook_func)
-
-#define BIND_FUNC_EXPORT_HOOK(name, pid, module, lib_nid, func_nid) \
-	name##_hook_uid = taiHookFunctionExportForKernel((pid), \
-		&name##_ref, (module), (lib_nid), (func_nid), name##_hook_func)
-
-#define UNBIND_FUNC_HOOK(name) \
-	do { \
-		if (name##_hook_uid > 0) \
-			taiHookReleaseForKernel(name##_hook_uid, name##_ref); \
-	} while(0)
 
 struct ds5_input_report {
 	unsigned char report_id;
-	unsigned char unk0;
-
 	unsigned char left_x;
 	unsigned char left_y;
 	unsigned char right_x;
 	unsigned char right_y;
-
-	unsigned char l_trigger;
-	unsigned char r_trigger;
-	unsigned char cnt1;
 
 	unsigned char dpad     : 4;
 	unsigned char square   : 1;
@@ -85,18 +46,44 @@ struct ds5_input_report {
 
 	unsigned char ps   : 1;
 	unsigned char tpad : 1;
-	unsigned char cnt2 : 1;
+	unsigned char cnt1 : 6;
 
-	unsigned char unk1[5];
+	unsigned char l_trigger;
+	unsigned char r_trigger;
 
-	signed short gyro_x;
-	signed short gyro_y;
-	signed short gyro_z;
+	unsigned char cnt2;
+	unsigned char cnt3;
+
+	unsigned char battery;
+
 	signed short accel_x;
 	signed short accel_y;
 	signed short accel_z;
 
-	unsigned char unk2[5];
+	union {
+		signed short roll;
+		signed short gyro_z;
+	};
+	union {
+		signed short yaw;
+		signed short gyro_y;
+	};
+	union {
+		signed short pitch;
+		signed short gyro_x;
+	};
+
+	unsigned char unk1[5];
+
+	unsigned char battery_level : 4;
+	unsigned char usb_plugged   : 1;
+	unsigned char headphones    : 1;
+	unsigned char microphone    : 1;
+	unsigned char padding       : 1;
+
+	unsigned char unk2[2];
+	unsigned char trackpadpackets;
+	unsigned char packetcnt;
 
 	unsigned int finger1_id        : 7;
 	unsigned int finger1_activelow : 1;
@@ -108,17 +95,9 @@ struct ds5_input_report {
 	unsigned int finger2_x         : 12;
 	unsigned int finger2_y         : 12;
 
-	unsigned char unk3[12];
-
-	unsigned char battery_level : 4;
-	unsigned char usb_plugged   : 1;
-	unsigned char battery_full  : 1;
-	unsigned char padding       : 2;
-
 } __attribute__((packed, aligned(32)));
 
 static SceUID bt_mempool_uid = -1;
-static SceUID bt_thread_evflag_uid = -1;
 static SceUID bt_thread_uid = -1;
 static SceUID bt_cb_uid = -1;
 static int bt_thread_run = 1;
@@ -129,7 +108,12 @@ static unsigned int ds5_mac1 = 0;
 
 static struct ds5_input_report ds5_input;
 
-static void ds5_input_reset()
+#define DECL_FUNC_HOOK(name, ...) \
+	static tai_hook_ref_t name##_ref; \
+	static SceUID name##_hook_uid = -1; \
+	static int name##_hook_func(__VA_ARGS__)
+
+static inline void ds5_input_reset(void)
 {
 	memset(&ds5_input, 0, sizeof(ds5_input));
 }
@@ -137,7 +121,7 @@ static void ds5_input_reset()
 static int is_ds5(const unsigned short vid_pid[2])
 {
 	return (vid_pid[0] == DS5_VID) &&
-		((vid_pid[1] == DS5_PID));
+		((vid_pid[1] == DS5_PID) || (vid_pid[1] == DS5_2_PID));
 }
 
 static inline void *mempool_alloc(unsigned int size)
@@ -209,51 +193,17 @@ static int ds5_send_0x11_report(unsigned int mac0, unsigned int mac1)
 	return 0;
 }
 
-DECL_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, SceCtrlPortInfo *info)
+static void reset_input_emulation()
 {
-	int ret = TAI_CONTINUE(int, SceCtrl_ksceCtrlGetControllerPortInfo_ref, info);
-
-	if (ret >= 0 && ds5_connected) {
-		// info->port[0] |= SCE_CTRL_TYPE_VIRT;
-		info->port[1] = SCE_CTRL_TYPE_DS5;
-	}
-
-	return ret;
+	ksceCtrlSetButtonEmulation(0, 0, 0, 0, 32);
+	ksceCtrlSetAnalogEmulation(0, 0, 0x80, 0x80, 0x80, 0x80,
+		0x80, 0x80, 0x80, 0x80, 0);
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo, int port, SceUInt8 *batt)
+static void set_input_emulation(struct ds5_input_report *ds5)
 {
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlGetBatteryInfo_ref, port, batt);
-
-	if (ds5_connected && port == 1) {
-		SceUInt8 k_batt;
-		ksceKernelMemcpyUserToKernel(&k_batt, (uintptr_t)batt, sizeof(k_batt));
-
-		if (ds5_input.usb_plugged) {
-			k_batt = ds5_input.battery_level <= 10 ? 0xEE : 0xEF;
-		} else {
-			if (ds5_input.battery_level == 0)
-				k_batt = 0;
-			else
-				k_batt = (ds5_input.battery_level / 2) + 1;
-
-			if (k_batt > 5)
-				k_batt = 5;
-		}
-
-		ksceKernelMemcpyKernelToUser((uintptr_t)batt, &k_batt, sizeof(k_batt));
-		return 0;
-	}
-
-	return ret;
-}
-
-static void patch_ctrl_data(const struct ds5_input_report *ds5, SceCtrlData *pad_data)
-{
-	signed char ldx, ldy, rdx, rdy;
 	unsigned int buttons = 0;
-	int left_js_moved = 0;
-	int right_js_moved = 0;
+	int js_moved = 0;
 
 	if (ds5->cross)
 		buttons |= SCE_CTRL_CROSS;
@@ -274,14 +224,14 @@ static void patch_ctrl_data(const struct ds5_input_report *ds5, SceCtrlData *pad
 		buttons |= SCE_CTRL_LEFT;
 
 	if (ds5->l1)
-		buttons |= SCE_CTRL_LTRIGGER;
+		buttons |= SCE_CTRL_L1;
 	if (ds5->r1)
-		buttons |= SCE_CTRL_RTRIGGER;
+		buttons |= SCE_CTRL_R1;
 
 	if (ds5->l2)
-		buttons |= SCE_CTRL_L1;
+		buttons |= SCE_CTRL_LTRIGGER;
 	if (ds5->r2)
-		buttons |= SCE_CTRL_R1;
+		buttons |= SCE_CTRL_RTRIGGER;
 
 	if (ds5->l3)
 		buttons |= SCE_CTRL_L3;
@@ -292,47 +242,30 @@ static void patch_ctrl_data(const struct ds5_input_report *ds5, SceCtrlData *pad
 		buttons |= SCE_CTRL_SELECT;
 	if (ds5->options)
 		buttons |= SCE_CTRL_START;
-
-	ldx = ds5->left_x - 128;
-	ldy = ds5->left_y - 128;
-	rdx = ds5->right_x - 128;
-	rdy = ds5->right_y - 128;
-
-	if (sqrtf(ldx * ldx + ldy * ldy) > DS5_JOYSTICK_THRESHOLD)
-		left_js_moved = 1;
-
-	if (sqrtf(rdx * rdx + rdy * rdy) > DS5_JOYSTICK_THRESHOLD)
-		right_js_moved = 1;
-
-	if (left_js_moved) {
-		pad_data->lx = ds5->left_x;
-		pad_data->ly = ds5->left_y;
-	}
-
-	if (right_js_moved) {
-		pad_data->rx = ds5->right_x;
-		pad_data->ry = ds5->right_y;
-	}
-
-	if (ds5->l_trigger > DS5_TRIGGER_THRESHOLD)
-		pad_data->lt = ds5->l_trigger;
-
-	if (ds5->r_trigger > DS5_TRIGGER_THRESHOLD)
-		pad_data->rt = ds5->r_trigger;
-
 	if (ds5->ps)
-		ksceCtrlSetButtonEmulation(0, 0, 0, SCE_CTRL_INTERCEPTED, 16);
+		buttons |= SCE_CTRL_INTERCEPTED;
 
-	if (buttons != 0 || left_js_moved || right_js_moved ||
-	    ds5->l_trigger > DS5_TRIGGER_THRESHOLD ||
-	    ds5->r_trigger > DS5_TRIGGER_THRESHOLD)
+	if ((abs(ds5->left_x - 128) > DS5_ANALOG_THRESHOLD) ||
+	    (abs(ds5->left_y - 128) > DS5_ANALOG_THRESHOLD) ||
+	    (abs(ds5->right_x - 128) > DS5_ANALOG_THRESHOLD) ||
+	    (abs(ds5->right_y - 128) > DS5_ANALOG_THRESHOLD) ||
+	    ds5->l_trigger > DS5_ANALOG_THRESHOLD ||
+	    ds5->r_trigger > DS5_ANALOG_THRESHOLD) {
+		js_moved = 1;
+	}
+
+	ksceCtrlSetButtonEmulation(0, 0, buttons, buttons, 32);
+
+	ksceCtrlSetAnalogEmulation(0, 0, ds5->left_x, ds5->left_y,
+		ds5->right_x, ds5->right_y, ds5->left_x, ds5->left_y,
+		ds5->right_x, ds5->right_y, 1);
+
+	if (buttons != 0 || js_moved)
 		ksceKernelPowerTick(0);
-
-	pad_data->buttons |= buttons;
 }
 
-static void patch_ctrl_data_all_user(const struct ds5_input_report *ds5,
-				     int port, SceCtrlData *pad_data, int count)
+static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
+			    struct ds5_input_report *ds5)
 {
 	unsigned int i;
 
@@ -340,97 +273,122 @@ static void patch_ctrl_data_all_user(const struct ds5_input_report *ds5,
 		SceCtrlData k_data;
 
 		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
-		patch_ctrl_data(ds5, &k_data);
+		if (abs(ds5->left_x - 128) > DS5_ANALOG_THRESHOLD)
+			k_data.lx = ds5->left_x;
+		if (abs(ds5->left_y - 128) > DS5_ANALOG_THRESHOLD)
+			k_data.ly = ds5->left_y;
+		if (abs(ds5->right_x - 128) > DS5_ANALOG_THRESHOLD)
+			k_data.rx = ds5->right_x;
+		if (abs(ds5->right_y - 128) > DS5_ANALOG_THRESHOLD)
+			k_data.ry = ds5->right_y;
+		if (ds5->l_trigger > DS5_ANALOG_THRESHOLD)
+			k_data.lt = ds5->l_trigger;
+		if (ds5->r_trigger > DS5_ANALOG_THRESHOLD)
+			k_data.rt = ds5->r_trigger;
 		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
 
 		pad_data++;
 	}
 }
 
-static void patch_ctrl_data_all_kernel(const struct ds5_input_report *ds5,
-				       int port, SceCtrlData *pad_data, int count)
+DECL_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, SceCtrlPortInfo *info)
 {
-	unsigned int i;
+	int ret = TAI_CONTINUE(int, SceCtrl_ksceCtrlGetControllerPortInfo_ref, info);
 
-	for (i = 0; i < count; i++, pad_data++)
-		patch_ctrl_data(ds5, pad_data);
-}
-
-#define DECL_FUNC_HOOK_PATCH_CTRL(type, name) \
-	DECL_FUNC_HOOK(SceCtrl_##name, int port, SceCtrlData *pad_data, int count) \
-	{ \
-		int ret = TAI_CONTINUE(int, SceCtrl_ ##name##_ref, port, pad_data, count); \
-		if (ret >= 0 && ds5_connected) \
-			patch_ctrl_data_all_##type(&ds5_input, port, pad_data, count); \
-		return ret; \
+	if (ret >= 0 && ds5_connected) {
+		// info->port[0] |= SCE_CTRL_TYPE_VIRT;
+		info->port[1] = SCE_CTRL_TYPE_DS4;
 	}
 
-DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlPeekBufferNegative)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferNegative2)
-DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlPeekBufferPositive)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositive2)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositiveExt)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlPeekBufferPositiveExt2)
-DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlReadBufferNegative)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferNegative2)
-DECL_FUNC_HOOK_PATCH_CTRL(kernel, ksceCtrlReadBufferPositive)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositive2)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositiveExt)
-DECL_FUNC_HOOK_PATCH_CTRL(user, sceCtrlReadBufferPositiveExt2)
+	return ret;
+}
 
-static void patch_touch_data(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs,
+DECL_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo, int port, SceUInt8 *batt)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlGetBatteryInfo_ref, port, batt);
+
+	if (ds5_connected && port == 1) {
+		SceUInt8 k_batt;
+		ksceKernelMemcpyUserToKernel(&k_batt, (uintptr_t)batt, sizeof(k_batt));
+		if (ds5_input.usb_plugged) {
+			k_batt = ds5_input.battery_level <= 10 ? 0xEE : 0xEF;
+		} else {
+			if (ds5_input.battery_level == 0) k_batt = 0;
+			else k_batt = (ds5_input.battery_level / 2) + 1;
+			if (k_batt > 5) k_batt = 5;
+		}
+		ksceKernelMemcpyKernelToUser((uintptr_t)batt, &k_batt, sizeof(k_batt));
+		return 0;
+	}
+
+	return ret;
+}
+
+DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds5_connected)
+		patch_analogdata(port, pad_data, count, &ds5_input);
+
+	return ret;
+}
+
+DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2, int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds5_connected)
+		patch_analogdata(port, pad_data, count, &ds5_input);
+
+	return ret;
+}
+
+DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositiveExt2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds5_connected)
+		patch_analogdata(port, pad_data, count, &ds5_input);
+
+	return ret;
+}
+
+DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
+{
+	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositiveExt2_ref, port, pad_data, count);
+
+	if (ret >= 0 && ds5_connected)
+		patch_analogdata(port, pad_data, count, &ds5_input);
+
+	return ret;
+}
+
+static void patch_touchdata(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs,
 			    struct ds5_input_report *ds5)
 {
 	unsigned int i;
 
-	if (port != SCE_TOUCH_PORT_FRONT && port != SCE_TOUCH_PORT_BACK)
+	if (port != SCE_TOUCH_PORT_FRONT)
 		return;
 
 	for (i = 0; i < nBufs; i++) {
 		unsigned int num_reports = 0;
 
-		if (port == SCE_TOUCH_PORT_FRONT) {
-			if (!ds5->finger1_activelow) {
-				pData->report[0].id = ds5->finger1_id;
-				pData->report[0].x = (ds5->finger1_x * VITA_FRONT_TOUCHSCREEN_W) / DS5_TOUCHPAD_W;
-				pData->report[0].y = (ds5->finger1_y * VITA_FRONT_TOUCHSCREEN_H) / DS5_TOUCHPAD_H;
-				num_reports++;
-			}
-
-			if (!ds5->finger2_activelow) {
-				pData->report[1].id = ds5->finger2_id;
-				pData->report[1].x = (ds5->finger2_x * VITA_FRONT_TOUCHSCREEN_W) / DS5_TOUCHPAD_W;
-				pData->report[1].y = (ds5->finger2_y * VITA_FRONT_TOUCHSCREEN_H) / DS5_TOUCHPAD_H;
-				num_reports++;
-			}
+		if (!ds5->finger1_activelow) {
+			pData->report[0].id = ds5->finger1_id;
+			pData->report[0].x = (ds5->finger1_x * VITA_FRONT_TOUCHSCREEN_W) / DS5_TOUCHPAD_W;
+			pData->report[0].y = (ds5->finger1_y * VITA_FRONT_TOUCHSCREEN_H) / DS5_TOUCHPAD_H;
+			num_reports++;
 		}
-		else {
 
-			if (ds5->l2 && ds5->r2) {
-				pData->report[0].id = ds5->l2_id;
-				pData->report[0].x = (VITA_BACK_TOUCHSCREEN_W * .25) ;
-				pData->report[0].y = (VITA_BACK_TOUCHSCREEN_H * .2);
-				
-				pData->report[1].id = ds5->r2_id;
-				pData->report[1].x = (VITA_BACK_TOUCHSCREEN_W * .75);
-				pData->report[1].y = (VITA_BACK_TOUCHSCREEN_H * .2);
-				
-				num_reports+=2;
-			}
-			else if (ds5->l2) {
-				pData->report[0].id = ds5->l2_id;
-				pData->report[0].x = (VITA_BACK_TOUCHSCREEN_W * .25);
-				pData->report[0].y = (VITA_BACK_TOUCHSCREEN_H * .2);
-				num_reports++;
-			}
-			else if (ds5->r2) {
-				pData->report[0].id = ds5->r2_id;
-				pData->report[0].x = (VITA_BACK_TOUCHSCREEN_W * .75);
-				pData->report[0].y = (VITA_BACK_TOUCHSCREEN_H * .2);
-				num_reports++;
-			}
+		if (!ds5->finger2_activelow) {
+			pData->report[1].id = ds5->finger2_id;
+			pData->report[1].x = (ds5->finger2_x * VITA_FRONT_TOUCHSCREEN_W) / DS5_TOUCHPAD_W;
+			pData->report[1].y = (ds5->finger2_y * VITA_FRONT_TOUCHSCREEN_H) / DS5_TOUCHPAD_H;
+			num_reports++;
 		}
-		
+
 		if (num_reports > 0) {
 			ksceKernelPowerTick(0);
 			pData->reportNum = num_reports;
@@ -445,7 +403,7 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchPeek, SceUInt32 port, SceTouchData *pData, SceU
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeek_ref, port, pData, nBufs);
 
 	if (ret >= 0 && ds5_connected)
-		patch_touch_data(port, pData, nBufs, &ds5_input);
+		patch_touchdata(port, pData, nBufs, &ds5_input);
 
 	return ret;
 }
@@ -455,7 +413,7 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchPeekRegion, SceUInt32 port, SceTouchData *pData
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeekRegion_ref, port, pData, nBufs, region);
 
 	if (ret >= 0 && ds5_connected)
-		patch_touch_data(port, pData, nBufs, &ds5_input);
+		patch_touchdata(port, pData, nBufs, &ds5_input);
 
 	return ret;
 }
@@ -465,7 +423,7 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchRead, SceUInt32 port, SceTouchData *pData, SceU
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchRead_ref, port, pData, nBufs);
 
 	if (ret >= 0 && ds5_connected)
-		patch_touch_data(port, pData, nBufs, &ds5_input);
+		patch_touchdata(port, pData, nBufs, &ds5_input);
 
 	return ret;
 }
@@ -475,7 +433,7 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchReadRegion, SceUInt32 port, SceTouchData *pData
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchReadRegion_ref, port, pData, nBufs, region);
 
 	if (ret >= 0 && ds5_connected)
-		patch_touch_data(port, pData, nBufs, &ds5_input);
+		patch_touchdata(port, pData, nBufs, &ds5_input);
 
 	return ret;
 }
@@ -613,7 +571,7 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 
 		case 0x06: /* Device disconnect event*/
 			ds5_connected = 0;
-			ds5_input_reset();
+			reset_input_emulation();
 			break;
 
 		case 0x08: /* Connection requested event */
@@ -635,10 +593,9 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 
 			switch (recv_buff[0]) {
 			case 0x11:
-				/*
-				 * Save DS5 state to a global variable.
-				 */
 				memcpy(&ds5_input, recv_buff, sizeof(ds5_input));
+
+				set_input_emulation(&ds5_input);
 
 				enqueue_read_request(hid_event.mac0, hid_event.mac1,
 					&hid_request, recv_buff, sizeof(recv_buff));
@@ -678,20 +635,13 @@ static int ds5vita_bt_thread(SceSize args, void *argp)
 #endif*/
 
 	while (bt_thread_run) {
-		int ret;
-		unsigned int evf_out;
-
-		ret = ksceKernelWaitEventFlagCB(bt_thread_evflag_uid, EVF_EXIT,
-			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &evf_out, NULL);
-		if (ret < 0)
-			continue;
-
-		if (evf_out & EVF_EXIT)
-			break;
+		ksceKernelDelayThreadCB(200 * 1000);
 	}
 
-	if (ds5_connected)
+	if (ds5_connected) {
 		ksceBtStartDisconnect(ds5_mac0, ds5_mac1);
+		reset_input_emulation();
+	}
 
 	ksceBtUnregisterCallback(bt_cb_uid);
 
@@ -702,6 +652,14 @@ static int ds5vita_bt_thread(SceSize args, void *argp)
 
 void _start() __attribute__ ((weak, alias ("module_start")));
 
+#define BIND_FUNC_OFFSET_HOOK(name, pid, modid, segidx, offset, thumb) \
+	name##_hook_uid = taiHookFunctionOffsetForKernel((pid), \
+		&name##_ref, (modid), (segidx), (offset), thumb, name##_hook_func)
+
+#define BIND_FUNC_EXPORT_HOOK(name, pid, module, lib_nid, func_nid) \
+	name##_hook_uid = taiHookFunctionExportForKernel((pid), \
+		&name##_ref, (module), (lib_nid), (func_nid), name##_hook_func)
+
 int module_start(SceSize argc, const void *args)
 {
 	int ret;
@@ -709,7 +667,7 @@ int module_start(SceSize argc, const void *args)
 
 	log_reset();
 
-	LOG("ds5vita by xerpi\n");
+	LOG("ds5vita by hedhehd\n");
 
 	SceBt_modinfo.size = sizeof(SceBt_modinfo);
 	ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceBt", &SceBt_modinfo);
@@ -730,52 +688,15 @@ int module_start(SceSize argc, const void *args)
 	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlGetBatteryInfo, KERNEL_PID,
 		"SceCtrl", TAI_ANY_LIBRARY, 0x8F9B1CE5);
 
-	/* SceCtrl hooks:
-	 * sceCtrlPeekBufferNegative -> ksceCtrlPeekBufferNegative
-	 * sceCtrlPeekBufferNegative2 -> none
-	 * sceCtrlPeekBufferPositive -> ksceCtrlPeekBufferPositive
-	 * sceCtrlPeekBufferPositive2 -> none
-	 * sceCtrlPeekBufferPositiveExt -> none
-	 * sceCtrlPeekBufferPositiveExt2 -> none
-	 * sceCtrlReadBufferNegative -> ksceCtrlReadBufferNegative
-	 * sceCtrlReadBufferNegative2 -> none
-	 * sceCtrlReadBufferPositive -> ksceCtrlReadBufferPositive
-	 * sceCtrlReadBufferPositive2 -> none
-	 * sceCtrlReadBufferPositiveExt -> none
-	 * sceCtrlReadBufferPositiveExt2 -> none
-	 */
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlPeekBufferNegative, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x19895843);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferNegative2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x81A89660);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlPeekBufferPositive, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xEA1D3A34);
-
+	/* SceCtrl hooks (needed for PS4 remote play) */
 	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, KERNEL_PID,
 		"SceCtrl", TAI_ANY_LIBRARY, 0x15F81E8C);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xA59454D3);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x860BF292);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlReadBufferNegative, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x8D4E0DD1);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferNegative2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x27A0C5FB);
-
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlReadBufferPositive, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x9B96A1AA);
 
 	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositive2, KERNEL_PID,
 		"SceCtrl", TAI_ANY_LIBRARY, 0xC4226A3E);
 
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xE2D99296);
+	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, KERNEL_PID,
+		"SceCtrl", TAI_ANY_LIBRARY, 0x860BF292);
 
 	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, KERNEL_PID,
 		"SceCtrl", TAI_ANY_LIBRARY, 0xA7178860);
@@ -809,10 +730,6 @@ int module_start(SceSize argc, const void *args)
 	bt_mempool_uid = ksceKernelCreateHeap("ds5vita_mempool", 0x100, &opt);
 	LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
 
-	bt_thread_evflag_uid = ksceKernelCreateEventFlag("ds5vita_bt_thread_evflag",
-							 0, 0, NULL);
-	LOG("Bluetooth thread event flag UID: 0x%08X\n", bt_thread_evflag_uid);
-
 	bt_thread_uid = ksceKernelCreateThread("ds5vita_bt_thread", ds5vita_bt_thread,
 		0x3C, 0x1000, 0, 0x10000, 0);
 	LOG("Bluetooth thread UID: 0x%08X\n", bt_thread_uid);
@@ -826,45 +743,34 @@ error_find_scebt:
 	return SCE_KERNEL_START_FAILED;
 }
 
+#define UNBIND_FUNC_HOOK(name) \
+	do { \
+		if (name##_hook_uid > 0) { \
+			taiHookReleaseForKernel(name##_hook_uid, name##_ref); \
+		} \
+	} while(0)
+
 int module_stop(SceSize argc, const void *args)
 {
 	SceUInt timeout = 0xFFFFFFFF;
 
-	bt_thread_run = 0;
-
-	if (bt_thread_evflag_uid)
-		ksceKernelSetEventFlag(bt_thread_evflag_uid, EVF_EXIT);
-
 	if (bt_thread_uid > 0) {
+		bt_thread_run = 0;
 		ksceKernelWaitThreadEnd(bt_thread_uid, NULL, &timeout);
 		ksceKernelDeleteThread(bt_thread_uid);
 	}
-
-	if (bt_thread_evflag_uid)
-		ksceKernelDeleteEventFlag(bt_thread_evflag_uid);
 
 	if (bt_mempool_uid > 0) {
 		ksceKernelDeleteHeap(bt_mempool_uid);
 	}
 
 	UNBIND_FUNC_HOOK(SceBt_sub_22999C8);
-
 	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo);
 	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo);
-
-	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlPeekBufferNegative);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferNegative2);
-	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlPeekBufferPositive);
 	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2);
-	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlReadBufferNegative);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferNegative2);
-	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlReadBufferPositive);
 	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt);
+	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2);
 	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2);
-
 	UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeek);
 	UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeekRegion);
 	UNBIND_FUNC_HOOK(SceTouch_ksceTouchRead);
